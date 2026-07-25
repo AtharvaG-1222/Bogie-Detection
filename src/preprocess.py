@@ -12,3 +12,7 @@ def bgr_gr(im):
 def gaussian_blur(im):
     blurred=cv2.GaussianBlur(im,(5,5),0)
     return blurred
+
+def canny(im):
+    edges=cv2.Canny(im, 50, 150)
+    return edges
