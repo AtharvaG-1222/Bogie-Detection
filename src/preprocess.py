@@ -14,7 +14,7 @@ def gaussian_blur(im):
     return blurred
 
 def canny(im):
-    edges=cv2.Canny(im, 40, 160)
+    edges=cv2.Canny(im, 100, 160)
     return edges
 
 def find_contours(image):

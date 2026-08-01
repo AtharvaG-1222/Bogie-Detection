@@ -8,7 +8,7 @@ from preprocess import resize_img, bgr_gr, gaussian_blur, canny, draw_contours, 
 def main():
 
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    im_path = os.path.join(BASE_DIR, "datasets", "normal", "im1.jpg")
+    im_path = os.path.join(BASE_DIR, "datasets", "normal", "Side 1.jpg")
     im = load_img(im_path)
 
     if im is None:
