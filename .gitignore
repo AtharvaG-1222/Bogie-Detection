@@ -1,2 +1,3 @@
 .venv
-Bogie dataset/
+dataset/
+anomaly_results/
