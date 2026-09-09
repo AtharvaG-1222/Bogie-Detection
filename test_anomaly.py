@@ -1,226 +1,289 @@
-# ==============================================================================
-# TEST ANOMALY SCRIPT (CLEAN HEATMAP WITH NOISE SUPPRESSION & ABSOLUTE THRESHOLD)
-# ==============================================================================
 import os
 import math
+from pathlib import Path
+
 import cv2
 import numpy as np
-from pathlib import Path
 from PIL import Image
-
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 
-# Import the existing ViT model from your project structure
-from src.models.vit.vit import VisionTransformer
+
+# ==============================================================================
+# 1. VISION TRANSFORMER BACKBONE
+# ==============================================================================
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x).flatten(2).transpose(1, 2)
 
 
-def get_default_device():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Inference Device: {device}")
-    return device
+class Attention(nn.Module):
+    def __init__(self, dim=768, num_heads=12, drop=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.attn_drop = nn.Dropout(drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj_drop(self.proj(x))
 
 
-def load_model(weights_path: str, device: torch.device):
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(
-            f"Weights file not found at: '{weights_path}'. "
-            f"Make sure training has completed and saved weights in the 'parameters' folder."
+class TransformerBlock(nn.Module):
+    def __init__(self, dim=768, num_heads=12, mlp_ratio=4.0, drop=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, num_heads=num_heads, drop=drop)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden, dim),
+            nn.Dropout(drop)
         )
 
-    # Initialize ViT Backbone (ViT-Base: patch 16, embed 768, depth 12, heads 12)
-    model = VisionTransformer(
-        img_size=224,
-        patch_size=16,
-        embed_dim=768,
-        depth=12,
-        num_heads=12
-    ).to(device)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-    # Load weights
+
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=12, num_heads=12):
+        super().__init__()
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
+        num_patches = self.patch_embed.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, num_heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor):
+        B, nc, w, h = x.shape
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        return x[:, 0], x[:, 1:]
+
+
+# ==============================================================================
+# 2. CHECKPOINT LOADER WITH COMPATIBILITY REMAPPING
+# ==============================================================================
+def load_trained_backbone(weights_path: str, device: torch.device):
+    model = VisionTransformer().to(device)
     state_dict = torch.load(weights_path, map_location=device)
-    # Handle if state dict was saved from full student or student.backbone
-    if "backbone" in state_dict:
-        state_dict = state_dict["backbone"]
 
-    model.load_state_dict(state_dict, strict=True)
+    if "student_state_dict" in state_dict:
+        state_dict = state_dict["student_state_dict"]
+
+    clean_state = {}
+    for k, v in state_dict.items():
+        if k.startswith("head."):
+            continue
+        cleaned = k.replace("backbone.", "")
+        if ".mlp.fc1." in cleaned:
+            cleaned = cleaned.replace(".mlp.fc1.", ".mlp.0.")
+        elif ".mlp.fc2." in cleaned:
+            cleaned = cleaned.replace(".mlp.fc2.", ".mlp.3.")
+        clean_state[cleaned] = v
+
+    model.load_state_dict(clean_state, strict=True)
     model.eval()
-    print(f"[+] Loaded trained ViT backbone successfully from: {weights_path}")
+    print(f"[*] Backbone weights loaded from: {weights_path}")
     return model
 
 
-def build_normal_memory_bank(model, normal_images_dir: str, device: torch.device, num_samples: int = 50):
-    """
-    Extracts baseline patch feature distributions from known normal bogie images.
-    """
-    transform = transforms.Compose([
+# ==============================================================================
+# 3. SPATIAL MEMORY BANK (3x3 SEARCH COMPATIBLE)
+# ==============================================================================
+def get_transform():
+    return transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+
+@torch.no_grad()
+def build_spatial_memory_bank(model, train_folder: str, device: torch.device, num_images: int = 100):
+    model.eval()
+    transform = get_transform()
+
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    # Exclude result files to avoid corrupting bank
     image_paths = [
-        p for p in Path(normal_images_dir).rglob("*")
-        if p.is_file() and p.suffix.lower() in valid_exts
-    ][:num_samples]
+        p for p in Path(train_folder).rglob("*")
+        if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
+    ][:num_images]
 
     if not image_paths:
-        print("[!] Warning: No images found to build normal bank. Using patch self-deviation mode.")
-        return None
+        raise FileNotFoundError(f"No reference training images in: {train_folder}")
 
-    print(f"[*] Building normal feature baseline from {len(image_paths)} normal reference images...")
-    features_list = []
+    print(f"[*] Building spatial memory bank from {len(image_paths)} normal training images...")
+    all_patches = []
 
-    with torch.no_grad():
-        for p in image_paths:
-            img = Image.open(p).convert("RGB")
-            tensor = transform(img).unsqueeze(0).to(device)
-            _, patch_tokens = model(tensor, return_patch_tokens=True)  # [1, N, C]
-            patch_tokens = F.normalize(patch_tokens, dim=-1, p=2)
-            features_list.append(patch_tokens.squeeze(0).cpu())
+    for path in image_paths:
+        orig = cv2.imread(str(path))
+        if orig is None:
+            continue
+        rgb = cv2.cvtColor(orig, cv2.COLOR_BGR2RGB)
+        tensor = transform(Image.fromarray(rgb)).unsqueeze(0).to(device)
 
-    # [K * N, C] -> Mean vector across normal features
-    all_features = torch.cat(features_list, dim=0)
-    mean_normal_feature = torch.mean(all_features, dim=0, keepdim=True).to(device)
-    mean_normal_feature = F.normalize(mean_normal_feature, dim=-1, p=2)
-    return mean_normal_feature
+        _, patches = model(tensor)
+        patches = F.normalize(patches.squeeze(0), dim=-1, p=2)
+        all_patches.append(patches.unsqueeze(1))  # [196, 1, 768]
+
+    # Stored as [196, N_images, 768]
+    spatial_bank = torch.cat(all_patches, dim=1).to(device)
+    print(f"[+] Spatial bank created: {spatial_bank.shape[1]} reference bogies mapped across 196 patches.")
+    return spatial_bank
 
 
-def run_inference_on_image(
-    model,
-    image_path: str,
-    output_dir: str,
-    device: torch.device,
-    mean_normal_feature=None,
-    noise_floor: float = 0.08,        # Anomaly scores below this stay uncolored (original image)
-    anomaly_threshold: float = 0.25   # Anomaly scores reaching this will be bright yellow/red
-):
-    orig_img = Image.open(image_path).convert("RGB")
-    orig_w, orig_h = orig_img.size
+# ==============================================================================
+# 4. TOLERANT 3x3 NEIGHBORHOOD INFERENCE
+# ==============================================================================
+@torch.no_grad()
+def evaluate_image(model, spatial_bank, image_path: str, device: torch.device, threshold: float = 0.40):
+    model.eval()
+    orig_bgr = cv2.imread(image_path)
+    if orig_bgr is None:
+        raise FileNotFoundError(f"Failed to load image: {image_path}")
+    orig_h, orig_w = orig_bgr.shape[:2]
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    input_tensor = transform(orig_img).unsqueeze(0).to(device)
+    # If image is black & white, equalize histogram to prevent channel collapse
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY)
+    is_grayscale = np.mean(np.abs(orig_bgr[:, :, 0] - orig_bgr[:, :, 1])) < 5
 
-    with torch.no_grad():
-        _, patch_tokens = model(input_tensor, return_patch_tokens=True)  # [1, 196, 768]
-        patch_tokens = F.normalize(patch_tokens, dim=-1, p=2)
-
-    # Number of patches along height/width (14x14 = 196 for 224x224 with patch size 16)
-    grid_size = int(math.sqrt(patch_tokens.shape[1]))
-
-    # Compute patch-level distance
-    if mean_normal_feature is not None:
-        # Distance to baseline normal representation
-        cosine_sim = torch.sum(patch_tokens * mean_normal_feature, dim=-1)  # [1, 196]
-        raw_dist = 1.0 - cosine_sim
+    if is_grayscale:
+        eq_gray = cv2.equalizeHist(gray)
+        rgb_input = cv2.cvtColor(eq_gray, cv2.COLOR_GRAY2RGB)
     else:
-        # Self-deviation mode against image average patch
-        center = torch.mean(patch_tokens, dim=1, keepdim=True)
-        center = F.normalize(center, dim=-1, p=2)
-        raw_dist = 1.0 - torch.sum(patch_tokens * center, dim=-1)
+        rgb_input = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
 
-    raw_dist = raw_dist.squeeze(0).cpu().numpy()
-    dist_grid = raw_dist.reshape((grid_size, grid_size))
+    transform = get_transform()
+    tensor = transform(Image.fromarray(rgb_input)).unsqueeze(0).to(device)
 
-    # Resize anomaly grid to the original input resolution
-    dist_map = cv2.resize(dist_grid, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+    # 1. Extract test features
+    _, test_patches = model(tensor)  # [1, 196, 768]
+    test_patches = F.normalize(test_patches.squeeze(0), dim=-1, p=2)  # [196, 768]
 
-    # Aggregate global image defect score (top 5% highest patch distances)
-    top_k_elements = max(1, int(raw_dist.size * 0.05))
-    defect_score = float(np.mean(np.sort(raw_dist)[-top_k_elements:]))
+    # 2. Local 3x3 Neighborhood Cosine Distance
+    # Reshape to grid representation: 14x14 patches
+    N = spatial_bank.shape[1]
+    test_grid = test_patches.view(14, 14, 768)
+    bank_grid = spatial_bank.view(14, 14, N, 768)
 
-    # ==============================================================================
-    # CLEAN HEATMAP RENDERING (NO WHOLE-IMAGE DISCOLORATION)
-    # ==============================================================================
-    # 1. Zero out baseline noise so normal metal/tracks do not get colored
-    clean_dist_map = np.where(dist_map < noise_floor, 0.0, dist_map - noise_floor)
+    patch_anomaly = np.zeros((14, 14), dtype=np.float32)
 
-    # 2. Scale against absolute threshold rather than min-max
-    norm_map = np.clip(clean_dist_map / (anomaly_threshold - noise_floor), 0.0, 1.0)
+    for r in range(14):
+        for c in range(14):
+            # 3x3 search window bounded by spatial limits
+            r_min, r_max = max(0, r - 1), min(14, r + 2)
+            c_min, c_max = max(0, c - 1), min(14, c + 2)
 
-    # 3. Create Heatmap
-    heatmap = cv2.applyColorMap(np.uint8(255 * norm_map), cv2.COLORMAP_JET)
+            # Local candidate patch pool from normal reference images: [Window_size * N, 768]
+            local_bank = bank_grid[r_min:r_max, c_min:c_max].reshape(-1, 768)
 
-    # 4. Prepare original OpenCV image (BGR)
-    cv_img = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2BGR)
+            # Cosine similarity against test patch (r, c)
+            sims = torch.mv(local_bank, test_grid[r, c])
+            max_sim = torch.max(sims).item()
+            patch_anomaly[r, c] = max(0.0, 1.0 - max_sim)
 
-    # 5. Mask blending: only apply color where norm_map > 0
-    alpha_mask = np.clip(norm_map * 0.7, 0.0, 0.7)[:, :, np.newaxis]
-    blended = (cv_img * (1.0 - alpha_mask) + heatmap * alpha_mask).astype(np.uint8)
+    # Calculate overall image score: mean of the top 5% most anomalous patches
+    flat_scores = patch_anomaly.flatten()
+    k = max(1, int(0.05 * len(flat_scores)))
+    anomaly_score = float(np.mean(np.sort(flat_scores)[-k:]))
 
-    # 6. Status Text overlay
-    is_anomaly = defect_score > anomaly_threshold
-    status_text = f"{'DEFECT DETECTED' if is_anomaly else 'NORMAL'} | Score: {defect_score:.4f}"
-    text_color = (0, 0, 255) if is_anomaly else (0, 255, 0)  # Red if defect, Green if normal
+    # 3. Non-relative heatmap rendering
+    heatmap_resized = cv2.resize(patch_anomaly, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+    clamped_map = np.clip(heatmap_resized / (threshold + 1e-6), 0.0, 1.0)
+    colored_map = cv2.applyColorMap((clamped_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
 
-    cv2.putText(
-        blended,
-        status_text,
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        text_color,
-        2,
-        cv2.LINE_AA
-    )
+    # Only highlight regions where anomaly distance exceeds 60% of the threshold
+    active_mask = (clamped_map > 0.60).astype(np.float32)[:, :, np.newaxis]
+    blended = (orig_bgr * (1.0 - (active_mask * 0.45)) + colored_map * (active_mask * 0.45)).astype(np.uint8)
 
-    # Save visualization output
-    os.makedirs(output_dir, exist_ok=True)
-    out_filename = os.path.join(output_dir, f"result_{Path(image_path).name}")
-    cv2.imwrite(out_filename, blended)
-    print(f"[{'!' if is_anomaly else '*'}] Processed: {Path(image_path).name} | Score: {defect_score:.4f} -> Saved: {out_filename}")
+    # 4. Status overlay
+    is_defect = anomaly_score >= threshold
+    status = f"DEFECT | Score: {anomaly_score:.4f}" if is_defect else f"NORMAL | Score: {anomaly_score:.4f}"
+    color = (0, 0, 255) if is_defect else (0, 255, 0)
+
+    cv2.putText(blended, status, (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
+    cv2.putText(blended, f"Threshold: {threshold:.4f}", (25, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
+
+    return blended, anomaly_score, is_defect
 
 
+# ==============================================================================
+# 5. MAIN EXECUTION
+# ==============================================================================
 def main():
-    device = get_default_device()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[*] Inference Device: {device}")
 
-    # Paths mapped to parameters folder
-    weights_path = os.path.join("parameters", "vit_bogie_dino.pth")
-    test_data_dir = os.path.join("dataset", "test")
-    train_reference_dir = os.path.join("dataset", "train")
-    output_dir = os.path.join("anomaly_results")
+    project_root = Path(__file__).resolve().parent
+    weights_path = project_root / "parameters" / "vit_bogie_dino.pth"
+    train_dir = project_root / "dataset" / "train"
+    test_dir = project_root / "dataset" / "test"
+    output_dir = project_root / "anomaly_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # If test folder doesn't exist, check single test image
-    if not os.path.exists(test_data_dir):
-        test_data_dir = train_reference_dir
-
-    # 1. Load Trained Model
-    model = load_model(weights_path, device)
-
-    # 2. Extract Normal Memory Distribution Baseline
-    mean_normal_feature = build_normal_memory_bank(model, train_reference_dir, device, num_samples=30)
-
-    # 3. Locate test images
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    model = load_trained_backbone(str(weights_path), device)
+    spatial_bank = build_spatial_memory_bank(model, str(train_dir), device, num_images=60)
+
+    # Baseline verification on training samples
+    print("\n[*] Validating on training samples to verify baseline distance...")
+    train_samples = [
+        p for p in train_dir.rglob("*")
+        if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
+    ][:5]
+
+    for p in train_samples:
+        _, score, _ = evaluate_image(model, spatial_bank, str(p), device, threshold=0.40)
+        print(f"  Training sample [{p.name}]: Distance = {score:.4f}")
+
+    # Set threshold (0.40 is standard; adjust based on training sample distance)
+    DETECTION_THRESHOLD = 0.40
+
     test_images = [
-        str(p) for p in Path(test_data_dir).rglob("*")
-        if p.is_file() and p.suffix.lower() in valid_exts
+        p for p in test_dir.rglob("*")
+        if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
     ]
 
-    print(f"[*] Found {len(test_images)} images for anomaly evaluation.")
-    if not test_images:
-        print("[!] No images found to test. Place an image in 'dataset/test/' and rerun.")
-        return
-
-    # 4. Run inference
+    print(f"\n[*] Evaluating {len(test_images)} test images...")
     for img_path in test_images:
-        run_inference_on_image(
-            model=model,
-            image_path=img_path,
-            output_dir=output_dir,
-            device=device,
-            mean_normal_feature=mean_normal_feature,
-            noise_floor=0.08,
-            anomaly_threshold=0.25
-        )
+        res, score, defect = evaluate_image(model, spatial_bank, str(img_path), device, threshold=DETECTION_THRESHOLD)
+        out_file = output_dir / f"result_{img_path.name}"
+        cv2.imwrite(str(out_file), res)
+        print(f"-> {img_path.name:<30} | {'DEFECT' if defect else 'NORMAL'} | Score: {score:.4f}")
 
-    print(f"\n[+] Anomaly detection finished. Inspection images saved to '{output_dir}'.")
+    print(f"\n[+] Inspection finished! Results saved to: {output_dir}")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ class DINOHead(nn.Module):
     def __init__(
         self,
         in_dim=768,
-        out_dim=65536,
+        out_dim=65536,       # 65536 for more images
         hidden_dim=2048,
         bottleneck_dim=256,
         nlayers=3
