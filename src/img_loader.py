@@ -1,9 +1,17 @@
 # src/img_loader.py
 import os
+import sys
 from pathlib import Path
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+# =====================================================================
+# DETERMINISTIC ABSOLUTE PATH RESOLUTION
+# =====================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # Valid image extensions across formats
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -25,23 +33,23 @@ def get_paths(target_subfolder="train"):
         for p in target_dirs:
             if any(f.suffix.lower() in VALID_EXTENSIONS for f in p.rglob("*")):
                 print(f"[Auto-Detect: Kaggle] Located '{target_subfolder}' folder: {p}")
-                return str(p), str(save_dir)
+                return str(p.resolve()), str(save_dir.resolve())
         
         # Fallback to first available directory inside /kaggle/input
         all_dirs = [p for p in kaggle_input.iterdir() if p.is_dir()]
         fallback = all_dirs[0] if all_dirs else kaggle_input
         print(f"[Auto-Detect: Kaggle] Subfolder '{target_subfolder}' not matched. Using: {fallback}")
-        return str(fallback), str(save_dir)
+        return str(fallback.resolve()), str(save_dir.resolve())
 
-    # 2. Local PC Environment Check
-    save_dir = Path.cwd()
+    # 2. Local PC Environment Check (Always anchored to PROJECT_ROOT)
+    save_dir = PROJECT_ROOT
     search_roots = [
-        Path.cwd(),
-        Path("dataset"),
-        Path("datasets"),
-        Path("Bogie dataset"),
-        Path("../Bogie dataset"),
-        Path("../dataset")
+        PROJECT_ROOT,
+        PROJECT_ROOT / "dataset",
+        PROJECT_ROOT / "datasets",
+        PROJECT_ROOT / "Bogie dataset",
+        PROJECT_ROOT.parent / "Bogie dataset",
+        PROJECT_ROOT.parent / "dataset"
     ]
 
     for root in search_roots:
@@ -71,11 +79,11 @@ class RailwayDataset(Dataset):
     Robust Dataset scanner that loads images safely with PIL.
     """
     def __init__(self, root_dir, transform=None):
-        self.root_dir = Path(root_dir)
+        self.root_dir = Path(root_dir).resolve()
         self.transform = transform
 
         self.image_paths = [
-            p for p in self.root_dir.rglob("*")
+            p.resolve() for p in self.root_dir.rglob("*")
             if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
         ]
 

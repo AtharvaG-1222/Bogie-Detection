@@ -1,11 +1,22 @@
 # src/models/vit/vit.py
+import sys
+from pathlib import Path
+
+# =====================================================================
+# DETERMINISTIC ABSOLUTE PATH RESOLUTION
+# Anchors 4 levels up: src/models/vit/vit.py -> vit -> models -> src -> PROJECT_ROOT
+# =====================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .patch_embed import PatchEmbedding
-from .block import TransformerBlock
+from src.models.vit.patch_embed import PatchEmbedding
+from src.models.vit.block import TransformerBlock
 
 
 class VisionTransformer(nn.Module):

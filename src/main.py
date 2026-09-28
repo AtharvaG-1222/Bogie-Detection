@@ -1,6 +1,15 @@
 import os
+import sys
 import math
 from pathlib import Path
+
+# =====================================================================
+# AUTOMATIC PROJECT ROOT DISCOVERY & PATH ANCHORING
+# Allows running from ANY directory: python "d:\...\src\main.py" or python -m src.main
+# =====================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 from torch.optim import AdamW
@@ -34,14 +43,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Execution device: {device}")
 
-    train_data_dir, _ = get_paths(target_subfolder="train")
+    # Anchor dataset paths to absolute references
+    raw_train_dir, _ = get_paths(target_subfolder="train")
+    train_data_dir = str(Path(raw_train_dir).resolve()) if os.path.isabs(raw_train_dir) else str((PROJECT_ROOT / raw_train_dir).resolve())
     
-    # Save artifacts into dedicated parameters folder
-    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters")
+    # Save artifacts into dedicated parameters folder outside src
+    save_dir = str((PROJECT_ROOT / "parameters").resolve())
     os.makedirs(save_dir, exist_ok=True)
 
-    checkpoint_file = os.path.join(save_dir, "checkpoint.pth")
-    final_backbone_file = os.path.join(save_dir, "new_para.pth")
+    checkpoint_file = str((Path(save_dir) / "checkpoint.pth").resolve())
+    final_backbone_file = str((Path(save_dir) / "new_para.pth").resolve())
 
     BATCH_SIZE = 16
     TOTAL_EPOCHS = 40
