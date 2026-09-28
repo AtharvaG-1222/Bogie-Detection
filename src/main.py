@@ -40,8 +40,8 @@ def main():
     save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameters")
     os.makedirs(save_dir, exist_ok=True)
 
-    checkpoint_file = os.path.join(save_dir, "vit_bogie_checkpoint.pth")
-    final_backbone_file = os.path.join(save_dir, "vit_bogie_dino.pth")
+    checkpoint_file = os.path.join(save_dir, "checkpoint.pth")
+    final_backbone_file = os.path.join(save_dir, "new_para.pth")
 
     BATCH_SIZE = 16
     TOTAL_EPOCHS = 40
