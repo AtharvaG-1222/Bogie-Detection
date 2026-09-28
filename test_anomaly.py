@@ -1,5 +1,13 @@
 import os
+import sys
 from pathlib import Path
+
+# =====================================================================
+# DETERMINISTIC ABSOLUTE PATH RESOLUTION
+# =====================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import cv2
 import numpy as np
@@ -50,7 +58,7 @@ def build_memory_bank(model, train_folder: str, device: torch.device, num_images
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
     image_paths = [
-        p for p in Path(train_folder).rglob("*")
+        p.resolve() for p in Path(train_folder).resolve().rglob("*")
         if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
     ][:num_images]
 
@@ -92,9 +100,10 @@ def evaluate_image(
     ballast_row_cutoff: int = 12
 ):
     model.eval()
-    orig_bgr = cv2.imread(image_path)
+    resolved_path = str(Path(image_path).resolve())
+    orig_bgr = cv2.imread(resolved_path)
     if orig_bgr is None:
-        raise FileNotFoundError(f"Failed to read image: {image_path}")
+        raise FileNotFoundError(f"Failed to read image: {resolved_path}")
     orig_h, orig_w = orig_bgr.shape[:2]
 
     transform = get_inference_transform()
@@ -147,14 +156,14 @@ def main():
     print(f"[*] Inference Device: {device}")
 
     project_root = Path(__file__).resolve().parent
-    weights_path = project_root / "parameters" / "params.pth"
-    train_dir = project_root / "dataset" / "train"
-    test_dir = project_root / "dataset" / "test"
-    output_dir = project_root / "anomaly_results"
+    weights_path = (project_root / "parameters" / "params.pth").resolve()
+    train_dir = (project_root / "dataset" / "train").resolve()
+    test_dir = (project_root / "dataset" / "test").resolve()
+    output_dir = (project_root / "anomaly_results").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not weights_path.exists():
-        fallback_ckpt = project_root / "parameters" / "checkpoint.pth"
+        fallback_ckpt = (project_root / "parameters" / "checkpoint.pth").resolve()
         if fallback_ckpt.exists():
             weights_path = fallback_ckpt
         else:
@@ -169,7 +178,7 @@ def main():
     # Calibrate threshold against normal train samples
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     train_samples = [
-        p for p in train_dir.rglob("*")
+        p.resolve() for p in train_dir.rglob("*")
         if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
     ][:5]
 
@@ -186,7 +195,7 @@ def main():
 
     # Evaluate test folder
     test_images = [
-        p for p in test_dir.rglob("*")
+        p.resolve() for p in test_dir.rglob("*")
         if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
     ]
 
@@ -200,7 +209,7 @@ def main():
             threshold=DETECTION_THRESHOLD, 
             ballast_row_cutoff=BALLAST_CUTOFF
         )
-        out_file = output_dir / f"result_{img_path.name}"
+        out_file = (output_dir / f"result_{img_path.name}").resolve()
         cv2.imwrite(str(out_file), res)
         print(f"-> {img_path.name:<30} | {'DEFECT' if defect else 'NORMAL'} | Score: {score:.4f}")
 
