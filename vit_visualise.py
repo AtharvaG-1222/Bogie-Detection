@@ -6,8 +6,6 @@ import numpy as np
 from PIL import Image
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 
@@ -15,8 +13,9 @@ import torchvision.transforms.functional as TF
 # CONFIGURATION
 # =====================================================================
 CHECKPOINT_PATH = "parameters/params.pth"
-TEST_IMAGE_PATH = "dataset/test"  # Direct image path ya test folder
-OUTPUT_IMAGE = "vit_learned_representation.jpg"
+TEST_IMAGE_PATH = "dataset/test"  # Direct image ya test folder
+OUTPUT_IMAGE = "Bogie Feature Representation.jpg"
+IMG_SIZE = 224
 # =====================================================================
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -60,7 +59,7 @@ def build_vit_model(checkpoint_path: str, device: torch.device):
 
     num_heads = max(1, embed_dim // 64)
     vit = VisionTransformer(
-        img_size=224,
+        img_size=IMG_SIZE,
         patch_size=patch_size,
         in_channels=3,
         embed_dim=embed_dim,
@@ -70,6 +69,22 @@ def build_vit_model(checkpoint_path: str, device: torch.device):
     vit.load_state_dict(clean_sd, strict=False)
     vit.to(device).eval()
     return vit, patch_size
+
+
+def letterbox_image(image: np.ndarray, target_size: int = 224):
+    """Aspect ratio maintain karte hue square mein pad karta hai taaki parts squish na hon."""
+    h, w = image.shape[:2]
+    scale = target_size / max(h, w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+    
+    pad_top = (target_size - new_h) // 2
+    pad_left = (target_size - new_w) // 2
+    canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
+    
+    return canvas, (pad_top, pad_top + new_h, pad_left, pad_left + new_w)
 
 
 def main():
@@ -82,7 +97,6 @@ def main():
 
     vit_model, patch_size = build_vit_model(str(ckpt_path), device)
 
-    # Image dhoondhna
     target_img_path = Path(TEST_IMAGE_PATH)
     if not target_img_path.is_absolute():
         target_img_path = CURRENT_DIR / target_img_path
@@ -96,26 +110,28 @@ def main():
     else:
         image_file = str(target_img_path)
 
-    print(f"[*] Visualizing ViT Feature Response for: {image_file}")
+    print(f"[*] Processing: {image_file}")
     img = cv2.imread(image_file)
     if img is None:
         raise ValueError(f"Image load nahi ho saki: {image_file}")
 
+    # Core mechanical crop: Left background cut karke suspension & wheel focus
     h, w = img.shape[:2]
-    # Bogie ROI isolate karna
-    y_min, y_max = int(h * 0.42), int(h * 0.70)
-    x_min, x_max = int(w * 0.05), int(w * 0.95)
+    y_min, y_max = int(h * 0.40), int(h * 0.72)
+    x_min, x_max = int(w * 0.20), int(w * 0.85)
     bogie_crop = img[y_min:y_max, x_min:x_max]
 
-    # Preprocessing
+    orig_h, orig_w = bogie_crop.shape[:2]
+
+    # Letterbox processing
     crop_rgb = cv2.cvtColor(bogie_crop, cv2.COLOR_BGR2RGB)
-    resized_crop = cv2.resize(crop_rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
-    pil_img = Image.fromarray(resized_crop)
-    
+    padded_rgb, (pt, pb, pl, pr) = letterbox_image(crop_rgb, target_size=IMG_SIZE)
+
+    pil_img = Image.fromarray(padded_rgb)
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     input_tensor = normalize(TF.to_tensor(pil_img)).unsqueeze(0).to(device)
 
-    # ViT Forward Pass (Feature Energy Map from Block 9 & 12)
+    # Feature Extraction
     with torch.no_grad():
         b, c, th, tw = input_tensor.shape
         x = vit_model.patch_embed(input_tensor)
@@ -123,37 +139,58 @@ def main():
         x = torch.cat((cls_token, x), dim=1) + vit_model.pos_embed
         x = vit_model.pos_drop(x)
 
-        tok_9 = None
-        for i, blk in enumerate(vit_model.blocks):
+        for blk in vit_model.blocks:
             x = blk(x)
-            if i == 8:
-                tok_9 = x[:, 1:, :]
 
-        tok_12 = vit_model.norm(x[:, 1:, :])
-        fused = torch.cat([tok_9, tok_12 * 0.25], dim=-1)
+        patch_features = vit_model.norm(x)[:, 1:, :]  # [1, 196, 768]
+        feat_np = patch_features.squeeze(0).cpu().numpy()
 
-        # Patch representation energy across spatial grid
-        grid_dim = 224 // patch_size
-        feature_energy = fused.norm(dim=-1).squeeze(0).reshape(grid_dim, grid_dim).cpu().numpy()
+    # PCA Projection to RGB
+    l2_norms = np.linalg.norm(feat_np, axis=-1, keepdims=True) + 1e-6
+    feat_norm = feat_np / l2_norms
 
-    # Normalization & Color Heatmap
-    feature_energy = (feature_energy - feature_energy.min()) / (feature_energy.max() - feature_energy.min() + 1e-6)
-    feature_energy = cv2.GaussianBlur(feature_energy, (3, 3), 0)
-    
-    heatmap = cv2.resize((feature_energy * 255).astype(np.uint8), (bogie_crop.shape[1], bogie_crop.shape[0]))
-    colored_map = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    # Subtract median across tokens
+    spatial_median = np.median(feat_norm, axis=0, keepdims=True)
+    centered = feat_norm - spatial_median
 
-    # Side-by-Side Presentation Layout
-    overlay = cv2.addWeighted(bogie_crop, 0.55, colored_map, 0.45, 0)
-    
-    # Text Labels add karna
-    cv2.putText(bogie_crop, "INPUT BOGIE ROI", (20, 35), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(overlay, "ViT LEARNED FEATURE ATTENTION", (20, 35), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    u, s, vt = np.linalg.svd(centered, full_matrices=False)
+    pca_3d = np.dot(centered, vt[:3, :].T)  # [196, 3]
+
+    for ch in range(3):
+        low, high = np.percentile(pca_3d[:, ch], (5, 95))
+        if high - low > 1e-6:
+            pca_3d[:, ch] = np.clip((pca_3d[:, ch] - low) / (high - low), 0.0, 1.0)
+        else:
+            pca_3d[:, ch] = 0.5
+
+    pca_rgb = (pca_3d * 255.0).astype(np.uint8)
+
+    # 14x14 Reshape
+    grid_dim = IMG_SIZE // patch_size
+    feature_map_14x14 = pca_rgb.reshape(grid_dim, grid_dim, 3)
+
+    # Upscale to 224x224
+    feature_map_224 = cv2.resize(feature_map_14x14, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_CUBIC)
+
+    # Unpad back to valid crop region
+    feature_map_unpadded = feature_map_224[pt:pb, pl:pr]
+    feature_map_bgr = cv2.cvtColor(feature_map_unpadded, cv2.COLOR_RGB2BGR)
+    feature_map_full = cv2.resize(feature_map_bgr, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+
+    # PREPARATION FOR PRESENTATION SLIDE: Semi-transparent Overlay
+    alpha = 0.50
+    overlay = cv2.addWeighted(bogie_crop, 1 - alpha, feature_map_full, alpha, 0)
+
+    # Clean Typography & Borders
+    cv2.rectangle(bogie_crop, (0, 0), (orig_w, 45), (20, 20, 20), -1)
+    cv2.putText(bogie_crop, "INPUT: BOGIE MECHANICAL ROI", (15, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.rectangle(overlay, (0, 0), (orig_w, 45), (20, 20, 20), -1)
+    cv2.putText(overlay, "ViT FEARTURE REPRESENTATION", (15, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
 
     combined = np.vstack([bogie_crop, overlay])
     cv2.imwrite(OUTPUT_IMAGE, combined)
-    print(f"\n[+] Visualization successful! Image saved as: {OUTPUT_IMAGE}")
-    print("[+] Is image ko presentation slide par lagao ViT feature activation dikhane ke liye.")
+    print(f"\n[+] Presentation deliverable saved: {OUTPUT_IMAGE}")
 
 
 if __name__ == "__main__":
