@@ -10,10 +10,10 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 
 # =====================================================================
-# CONFIGURATION
+# CONFIGURATION (Exact as provided)
 # =====================================================================
 CHECKPOINT_PATH = "parameters/params.pth"
-TEST_IMAGE_PATH = "dataset/test"  # Direct image ya test folder
+TEST_IMAGE_PATH = "dataset/test/img-24-_jpg.rf.19fa9d7d318893b9491ffdc575cb3284.jpg"
 OUTPUT_IMAGE = "Bogie Feature Representation.jpg"
 IMG_SIZE = 224
 # =====================================================================
@@ -76,14 +76,14 @@ def letterbox_image(image: np.ndarray, target_size: int = 224):
     h, w = image.shape[:2]
     scale = target_size / max(h, w)
     new_w, new_h = int(w * scale), int(h * scale)
-    
+
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
     canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-    
+
     pad_top = (target_size - new_h) // 2
     pad_left = (target_size - new_w) // 2
     canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
-    
+
     return canvas, (pad_top, pad_top + new_h, pad_left, pad_left + new_w)
 
 
@@ -103,7 +103,10 @@ def main():
 
     if target_img_path.is_dir():
         valid_exts = {".jpg", ".jpeg", ".png", ".bmp"}
-        candidates = sorted([p for p in target_img_path.rglob("*") if p.suffix.lower() in valid_exts and not p.name.startswith("result_")])
+        candidates = sorted([
+            p for p in target_img_path.rglob("*")
+            if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
+        ])
         if not candidates:
             raise FileNotFoundError("dataset/test folder mein koi valid image nahi mili.")
         image_file = str(candidates[0])
@@ -115,10 +118,12 @@ def main():
     if img is None:
         raise ValueError(f"Image load nahi ho saki: {image_file}")
 
-    # Core mechanical crop: Left background cut karke suspension & wheel focus
+    # =================================================================
+    # EXPANDED FULL BOGIE ROI (Covers Complete Wheels + Full Frame)
+    # =================================================================
     h, w = img.shape[:2]
-    y_min, y_max = int(h * 0.40), int(h * 0.72)
-    x_min, x_max = int(w * 0.20), int(w * 0.85)
+    y_min, y_max = int(h * 0.30), int(h * 0.80)
+    x_min, x_max = int(w * 0.02), int(w * 0.98)
     bogie_crop = img[y_min:y_max, x_min:x_max]
 
     orig_h, orig_w = bogie_crop.shape[:2]
@@ -177,7 +182,7 @@ def main():
     feature_map_bgr = cv2.cvtColor(feature_map_unpadded, cv2.COLOR_RGB2BGR)
     feature_map_full = cv2.resize(feature_map_bgr, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
-    # PREPARATION FOR PRESENTATION SLIDE: Semi-transparent Overlay
+    # Semi-transparent Overlay (50% blend)
     alpha = 0.50
     overlay = cv2.addWeighted(bogie_crop, 1 - alpha, feature_map_full, alpha, 0)
 
@@ -186,7 +191,7 @@ def main():
     cv2.putText(bogie_crop, "INPUT: BOGIE MECHANICAL ROI", (15, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
     cv2.rectangle(overlay, (0, 0), (orig_w, 45), (20, 20, 20), -1)
-    cv2.putText(overlay, "ViT FEARTURE REPRESENTATION", (15, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(overlay, "ViT FEATURE REPRESENTATION", (15, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
 
     combined = np.vstack([bogie_crop, overlay])
     cv2.imwrite(OUTPUT_IMAGE, combined)
