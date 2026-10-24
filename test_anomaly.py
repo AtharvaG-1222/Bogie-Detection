@@ -399,3 +399,5 @@ if __name__ == "__main__":
             print(f"[{idx:02d}/{len(test_images):02d}] {name:<30} -> {tag} | Peak: {report['peak_score']:.4f} | Area: {report['defect_pct']:.2f}% | Regions: {report['regions']}")
 
     print(f"\n[+] Inspection complete! Output folder: {out_path}")
+
+    # for github
