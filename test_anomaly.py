@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 
-# =====================================================================
+# ======================================================================
 # CONFIGURATION
-# =====================================================================
+# ======================================================================
 CHECKPOINT_PATH = "parameters/params.pth"
 DATASET_TRAIN_DIR = "dataset/train"
 DATASET_TEST_DIR = "dataset/test"
