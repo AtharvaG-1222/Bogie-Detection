@@ -1,0 +1,11 @@
+__pycache__
+.git
+.venv
+*.pyc
+dataset/
+parameters/
+anomaly_results/
+.gitignore
+.gitattributes
+Bogie Feature Representation.jpg
+*.jpg

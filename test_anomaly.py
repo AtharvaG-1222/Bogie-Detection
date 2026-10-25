@@ -1,8 +1,7 @@
 import os
 import sys
-import glob
 from pathlib import Path
-from typing import Tuple, List, Dict
+from typing import Tuple, Dict
 import cv2
 import numpy as np
 from PIL import Image
@@ -17,11 +16,10 @@ import torchvision.transforms.functional as TF
 # CONFIGURATION
 # ======================================================================
 CHECKPOINT_PATH = "parameters/params.pth"
-DATASET_TRAIN_DIR = "dataset/train"
+FEATURE_BANK_PATH = "parameters/bogie_feature_bank.pt"
 DATASET_TEST_DIR = "dataset/test"
 OUTPUT_DIR = "anomaly_results"
-CORESET_BUDGET = 40000
-# =====================================================================
+# ======================================================================
 
 CURRENT_DIR = Path(__file__).resolve().parent
 for p in [CURRENT_DIR, CURRENT_DIR.parent]:
@@ -31,12 +29,25 @@ for p in [CURRENT_DIR, CURRENT_DIR.parent]:
 from src.models.vit.vit import VisionTransformer
 
 
+def get_optimal_device() -> torch.device:
+    """Windows/Linux (CUDA), Mac (MPS), ya CPU ko automatically detect karta hai."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+def get_device_name(device: torch.device) -> str:
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(0)
+    elif device.type == "mps":
+        return "Apple Silicon GPU (MPS)"
+    return "CPU"
+
+
 class BogieIntermediateFeatureExtractor(nn.Module):
-    """
-    Extracts multi-scale representations directly from Blocks 9 and 12.
-    - Block 9 captures local textures, surface cracks, and edge degradation.
-    - Block 12 context is scaled (0.25x) to eliminate lighting bloom and shadow bias.
-    """
     def __init__(self, vit_model: VisionTransformer):
         super().__init__()
         self.vit = vit_model
@@ -71,11 +82,10 @@ class RailwayBogieInspectionEngine:
     def __init__(
         self,
         checkpoint_path: str,
-        coreset_budget: int = 40000,
-        device: str = "cuda"
+        feature_bank_path: str,
+        device: torch.device = None
     ):
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.coreset_budget = coreset_budget
+        self.device = device if device is not None else get_optimal_device()
 
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
@@ -128,18 +138,24 @@ class RailwayBogieInspectionEngine:
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225]
         )
-        self.memory_bank = None
-        self.calibrated_threshold = 0.2200
 
-        print(f"[+] Device: {self.device}")
+        if not os.path.exists(feature_bank_path):
+            raise FileNotFoundError(
+                f"Feature bank file nahi mili: {feature_bank_path}\n"
+                f"Pehle 'build_and_save_feature_bank.py' run karke bank generate karo."
+            )
+
+        print(f"[*] Loading precomputed feature bank: {feature_bank_path}")
+        payload = torch.load(feature_bank_path, map_location=self.device)
+        self.memory_bank = payload["memory_bank"].to(self.device)
+        self.calibrated_threshold = float(payload["calibrated_threshold"])
+
+        print(f"[+] Active Execution Device: {self.device} ({get_device_name(self.device)})")
         print(f"[+] ViT: embed_dim={embed_dim}, patch_size={self.patch_size}")
+        print(f"[+] Memory Bank Ready: {self.memory_bank.shape[0]} tokens indexed.")
+        print(f"[+] Calibrated Defect Threshold: {self.calibrated_threshold:.4f}\n")
 
     def _get_bogie_bounds(self, img_h: int, img_w: int) -> Tuple[int, int, int, int]:
-        """
-        Tight bogie undercarriage bounds:
-        - Drops upper 40% (carriage doors, windows, passengers)
-        - Drops bottom 32% (rail tracks, ballast stones, ground clutter)
-        """
         y_min = int(img_h * 0.40)
         y_max = int(img_h * 0.68)
         x_min = int(img_w * 0.05)
@@ -152,77 +168,13 @@ class RailwayBogieInspectionEngine:
         taper = ky @ kx.T
         return taper / max(1e-5, float(taper.max()))
 
-    @torch.no_grad()
-    def build_memory_bank(self, normal_image_paths: List[str]):
-        extracted_tokens = []
-        print(f"[*] Extracting normal reference tokens from {len(normal_image_paths)} images...")
-
-        for p in normal_image_paths:
-            img = cv2.imread(p)
-            if img is None:
-                continue
-            h, w = img.shape[:2]
-            y1, y2, x1, x2 = self._get_bogie_bounds(h, w)
-            bogie_crop = img[y1:y2, x1:x2]
-
-            crop_rgb = cv2.cvtColor(bogie_crop, cv2.COLOR_BGR2RGB)
-            ch, cw = crop_rgb.shape[:2]
-
-            x_steps = list(range(0, max(1, cw - 224 + 1), 112))
-            if not x_steps or x_steps[-1] != max(0, cw - 224):
-                x_steps.append(max(0, cw - 224))
-
-            batch_crops = []
-            for xs in x_steps:
-                sub = crop_rgb[:, xs:min(cw, xs + 224)]
-                sub = cv2.resize(sub, (224, 224), interpolation=cv2.INTER_LINEAR)
-                sub_tensor = TF.to_tensor(Image.fromarray(sub))
-                batch_crops.append(self.normalize(sub_tensor))
-
-            if not batch_crops:
-                continue
-
-            batch_tensor = torch.stack(batch_crops).to(self.device)
-            patches = self.feature_extractor(batch_tensor)
-            patches = patches[:, ::2, :].reshape(-1, patches.shape[-1])
-            extracted_tokens.append(patches.cpu())
-
-        if not extracted_tokens:
-            raise RuntimeError("Failed to build memory bank from train images.")
-
-        full_bank = torch.cat(extracted_tokens, dim=0).to(self.device)
-        total_tokens = full_bank.shape[0]
-
-        if total_tokens > self.coreset_budget:
-            step = max(1, total_tokens // self.coreset_budget)
-            self.memory_bank = full_bank[::step][:self.coreset_budget]
-        else:
-            self.memory_bank = full_bank
-
-        # Calibrate distance baseline by cross-matching (skipping self-token index 0)
-        sample_bank = self.memory_bank[:min(1200, self.memory_bank.shape[0])]
-        sims = torch.mm(sample_bank, self.memory_bank.T)
-        top_sims, _ = torch.topk(sims, k=6, dim=-1)
-        base_distances = (1.0 - top_sims[:, 1:5].mean(dim=-1)).clamp(min=0.0).cpu().numpy()
-
-        b_mean = float(np.mean(base_distances))
-        b_std = float(np.std(base_distances))
-
-        # 0.2200 baseline floor prevents healthy bogie components from crossing the threshold
-        calculated = b_mean + 3.0 * b_std
-        self.calibrated_threshold = round(max(0.2200, calculated), 4)
-
-        print(f"[+] Memory Bank Ready: {self.memory_bank.shape[0]} normal tokens indexed.")
-        print(f"[+] Baseline Normal Distance: {b_mean:.4f} (Std: {b_std:.4f})")
-        print(f"[+] Calibrated Defect Threshold: {self.calibrated_threshold:.4f}\n")
-
     def inspect_bogie_image(
         self,
         img_path: str,
         stride: int = 64,
         window_size: int = 224
     ) -> Tuple[np.ndarray, Dict]:
-        orig_img = cv2.imread(img_path)
+        orig_img = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR)
         if orig_img is None:
             return None, None
 
@@ -277,7 +229,6 @@ class RailwayBogieInspectionEngine:
         roi_mask[y_min:y_max, x_min:x_max] = 1
         smoothed_heatmap = smoothed_heatmap * roi_mask
 
-        # Defect segmentation: pixel must meet or exceed calibrated threshold
         defect_mask = ((smoothed_heatmap >= self.calibrated_threshold) & (roi_mask > 0)).astype(np.uint8) * 255
         defect_mask = cv2.morphologyEx(defect_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
 
@@ -287,7 +238,6 @@ class RailwayBogieInspectionEngine:
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            # Suppress minor noise and paint chips smaller than 120 pixels
             if area < 120:
                 continue
 
@@ -295,7 +245,6 @@ class RailwayBogieInspectionEngine:
             cv2.drawContours(cnt_mask, [cnt], -1, 1, -1)
             peak_val = float(smoothed_heatmap[cnt_mask > 0].max())
 
-            # Real structural defects must have strong localized divergence
             if peak_val >= (self.calibrated_threshold * 1.10):
                 valid_contours.append(cnt)
                 defect_pixel_count += area
@@ -306,7 +255,6 @@ class RailwayBogieInspectionEngine:
 
         overlay = orig_img.copy()
 
-        # ONLY draw overlays if actual defect contours exist
         if is_defective:
             tint_layer = np.zeros_like(orig_img)
             cv2.drawContours(tint_layer, valid_contours, -1, (0, 0, 220), -1)
@@ -343,13 +291,15 @@ class RailwayBogieInspectionEngine:
 
 
 if __name__ == "__main__":
+    device = get_optimal_device()
+
     ckpt_path = Path(CHECKPOINT_PATH)
     if not ckpt_path.is_absolute():
         ckpt_path = CURRENT_DIR / ckpt_path
 
-    train_path = Path(DATASET_TRAIN_DIR)
-    if not train_path.is_absolute():
-        train_path = CURRENT_DIR / train_path
+    bank_path = Path(FEATURE_BANK_PATH)
+    if not bank_path.is_absolute():
+        bank_path = CURRENT_DIR / bank_path
 
     test_path = Path(DATASET_TEST_DIR)
     if not test_path.is_absolute():
@@ -362,27 +312,19 @@ if __name__ == "__main__":
 
     print("=" * 65)
     print(f"[*] Target Checkpoint : {ckpt_path}")
-    print(f"[*] Dataset Train     : {train_path}")
+    print(f"[*] Feature Bank File : {bank_path}")
     print(f"[*] Dataset Test      : {test_path}")
     print(f"[*] Output Folder     : {out_path}")
+    print(f"[*] Enforcing Device  : {device} ({get_device_name(device)})")
     print("=" * 65 + "\n")
 
     engine = RailwayBogieInspectionEngine(
         checkpoint_path=str(ckpt_path),
-        coreset_budget=CORESET_BUDGET
+        feature_bank_path=str(bank_path),
+        device=device
     )
 
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    train_images = sorted([
-        str(p) for p in train_path.rglob("*")
-        if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
-    ])
-
-    if not train_images:
-        raise FileNotFoundError(f"Training dataset directory is empty: {train_path}")
-
-    engine.build_memory_bank(train_images[:60])
-
     test_images = sorted([
         str(p) for p in test_path.rglob("*")
         if p.suffix.lower() in valid_exts and not p.name.startswith("result_")
@@ -399,5 +341,3 @@ if __name__ == "__main__":
             print(f"[{idx:02d}/{len(test_images):02d}] {name:<30} -> {tag} | Peak: {report['peak_score']:.4f} | Area: {report['defect_pct']:.2f}% | Regions: {report['regions']}")
 
     print(f"\n[+] Inspection complete! Output folder: {out_path}")
-
-    # for github

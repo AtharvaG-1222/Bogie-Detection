@@ -1,5 +1,5 @@
 .venv
-dataset/
 anomaly_results/
-parameters/
 kaggle_scripts/
+dataset/
+parameters/
